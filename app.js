@@ -6,7 +6,7 @@ const PG_BLOCKED_TERMS = [
     "nude", "naked", "strip", "provocative", "suggestive", "inappropriate",
     "drunk", "alcohol", "beer", "wine", "vodka", "weed", "marijuana",
     "vape", "vaping", "cigarette", "smoking", "drug", "cocaine",
-    "damn", "hell", "crap", "shit", "fuck", "bitch", "ass ",
+    "damn", "hell", "crap", "shit", "fuck", "bitch", "ass",
     "kill yourself", "suicide", "self-harm", "cutting",
     "post my fits", "fits check", "body count", "ghosting",
     "dm slide", "slide into", "netflix and chill"
@@ -15,7 +15,11 @@ const PG_BLOCKED_TERMS = [
 function isTextPG(text) {
     if (!text || typeof text !== "string") return false;
     const normalized = text.toLowerCase();
-    return !PG_BLOCKED_TERMS.some(term => normalized.includes(term));
+    return !PG_BLOCKED_TERMS.some((term) => {
+        const escaped = term.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const pattern = new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`, "i");
+        return pattern.test(normalized);
+    });
 }
 
 function isQuestionPG(question) {
@@ -57,8 +61,33 @@ function normalizeQuestionSet(rawQuestions) {
     }));
 }
 
+function getRecentFallbackKeys() {
+    try {
+        const raw = sessionStorage.getItem("recentFallbackKeys");
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function rememberFallbackKeys(selected) {
+    const keys = selected.map((q) => q.category + "::" + q.text);
+    const merged = [...keys, ...getRecentFallbackKeys()].slice(0, 15);
+    try {
+        sessionStorage.setItem("recentFallbackKeys", JSON.stringify(merged));
+    } catch (e) {
+        // Ignore storage failures (private mode, quota, etc.)
+    }
+}
+
 function getFallbackQuestions() {
-    return shuffleArray(questions).slice(0, QUESTIONS_PER_QUIZ);
+    const recent = new Set(getRecentFallbackKeys());
+    const fresh = questions.filter((q) => !recent.has(q.category + "::" + q.text));
+    const pool = fresh.length >= QUESTIONS_PER_QUIZ ? fresh : questions;
+    const selected = shuffleArray(pool).slice(0, QUESTIONS_PER_QUIZ);
+    rememberFallbackKeys(selected);
+    return selected;
 }
 
 // Quiz questions data (10 exact questions with weighted scores)
@@ -575,120 +604,58 @@ function showVibeDetail(vibeKey) {
 }
 
 async function fetchAIQuestions() {
-    const GEMINI_API_KEY =
-        typeof window !== "undefined" && window.GEMINI_API_KEY
-            ? window.GEMINI_API_KEY.trim()
-            : "";
-    if (!GEMINI_API_KEY) {
-        throw new Error(
-            "Missing Gemini API key. Copy config.example.js to config.local.js and add your key."
-        );
-    }
-    const MODEL = "gemini-2.5-flash";
-    const URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-    
-    const randomSeed = Math.random().toString(36).substring(7);
-    const prompt = `Generate exactly 5 fun, engaging personality quiz questions for a Teen Wellness Vibe Check used in a Kaiser Permanente school and healthcare setting.
+    // Key stays on the server (Vercel env / local .env). Browser never sees it.
+    // Retry a few times — Gemini often returns temporary 503/high-demand errors.
+    const maxAttempts = 3;
+    let lastError = "Failed to generate AI questions";
 
-AUDIENCE & CONTENT RULES (CRITICAL — MUST FOLLOW):
-- Audience is school-aged students, including younger kids (approximately ages 10–17).
-- ALL content MUST be PG-rated, family-friendly, school-appropriate, and comfortable for every user.
-- NEVER include sexual, romantic, suggestive, provocative, or attention-seeking social media behavior.
-- NEVER use slang like "thirst trap", "rizz", "post my fits", or any edgy/internet slang that could feel inappropriate.
-- NEVER include profanity, crude humor, alcohol, drugs, violence, self-harm, or mature themes.
-- Social media questions must focus on positive uses: learning, creativity, staying connected with friends, hobbies, and wellness — never posting for attraction or suggestive content.
-- Use warm, inclusive, respectful language that would be approved for a classroom or pediatric waiting room.
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            const response = await fetch("/api/generate-questions", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: "{}"
+            });
 
-Each question should have a category, a question text, and exactly 5 distinct answer choices. Each answer choice must have a code (A, B, C, D, or E) and point weights (scores) for the four wellness vibes: mystic, spark, creator, anchor.
+            const data = await response.json().catch(() => ({}));
 
-Here are the details of the wellness vibes for scoring guidance:
-- mystic: Thrives on quiet reflection, self-awareness, and mental clarity. (e.g., options involving solo relaxation, introspection, quiet, nature, meditation)
-- spark: Thrives on energy, staying active, and connecting with others. (e.g., options involving active socializing, sports, high energy, movement)
-- creator: Processes the world through art, projects, and self-expression. (e.g., options involving hobbies, design, drawing, writing, building, original ideas)
-- anchor: Organized, dependable, balanced, and a reliable friend. (e.g., options involving organization, planners, helping others, stability, routines)
-
-Make sure the questions are fresh, diverse, creative, relatable for students, and completely different from the standard ones. Each question option should assign points (integers, typically 1 to 3) to one or more vibes depending on how it aligns with that personality type.
-Ensure that the generation is highly unique and creative (Random Seed: ${randomSeed}).`;
-
-    const requestBody = {
-        contents: [
-            {
-                parts: [
-                    {
-                        text: prompt
-                    }
-                ]
-            }
-        ],
-        safetySettings: [
-            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_LOW_AND_ABOVE" },
-            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_LOW_AND_ABOVE" },
-            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_LOW_AND_ABOVE" },
-            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_LOW_AND_ABOVE" }
-        ],
-        generationConfig: {
-            temperature: 0.7,
-            responseMimeType: "application/json",
-            responseSchema: {
-                type: "ARRAY",
-                items: {
-                    type: "OBJECT",
-                    properties: {
-                        category: { type: "STRING" },
-                        text: { type: "STRING" },
-                        answers: {
-                            type: "ARRAY",
-                            items: {
-                                type: "OBJECT",
-                                properties: {
-                                    text: { type: "STRING" },
-                                    code: { type: "STRING" },
-                                    scores: {
-                                        type: "OBJECT",
-                                        properties: {
-                                            mystic: { type: "INTEGER" },
-                                            spark: { type: "INTEGER" },
-                                            creator: { type: "INTEGER" },
-                                            anchor: { type: "INTEGER" }
-                                        }
-                                    }
-                                },
-                                required: ["text", "code", "scores"]
-                            }
-                        }
-                    },
-                    required: ["category", "text", "answers"]
+            if (!response.ok) {
+                lastError = data.error || `HTTP error! status: ${response.status}`;
+                if (attempt < maxAttempts) {
+                    await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
+                    continue;
                 }
+                throw new Error(lastError);
             }
+
+            const normalizedQuestions = normalizeQuestionSet(data.questions || []);
+
+            if (!isQuestionSetPG(normalizedQuestions)) {
+                lastError = "AI-generated questions failed PG content validation";
+                if (attempt < maxAttempts) {
+                    await new Promise((resolve) => setTimeout(resolve, 800 * attempt));
+                    continue;
+                }
+                throw new Error(lastError);
+            }
+
+            return normalizedQuestions;
+        } catch (error) {
+            lastError = error.message || String(error);
+            if (attempt >= maxAttempts) {
+                throw new Error(lastError);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
         }
-    };
-
-    const response = await fetch(URL, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify(requestBody)
-    });
-
-    if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
     }
 
-    const data = await response.json();
-    const rawText = data.candidates[0].content.parts[0].text;
-    const parsedQuestions = JSON.parse(rawText);
-    const normalizedQuestions = normalizeQuestionSet(parsedQuestions);
-
-    if (!isQuestionSetPG(normalizedQuestions)) {
-        throw new Error("AI-generated questions failed PG content validation");
-    }
-
-    return normalizedQuestions;
+    throw new Error(lastError);
 }
 
 async function startQuiz() {
-    activeQuestions = getFallbackQuestions();
+    activeQuestions = null;
 
     startScreen.classList.remove("active");
     
@@ -700,7 +667,8 @@ async function startQuiz() {
     const messages = [
         "Connecting to Gemini AI...",
         "Crafting fresh vibes...",
-        "Personalizing wellness check..."
+        "Personalizing wellness check...",
+        "Still working — Gemini can be busy..."
     ];
     let msgIndex = 0;
     revealTextEl.innerText = messages[0];
@@ -708,18 +676,29 @@ async function startQuiz() {
     const interval = setInterval(() => {
         msgIndex = (msgIndex + 1) % messages.length;
         revealTextEl.innerText = messages[msgIndex];
-    }, 800);
+    }, 1200);
 
+    let usedAI = false;
     try {
         const aiQuestions = await fetchAIQuestions();
         if (aiQuestions && aiQuestions.length === QUESTIONS_PER_QUIZ) {
             activeQuestions = aiQuestions;
+            usedAI = true;
         }
     } catch (e) {
         console.warn("Using curated PG fallback questions:", e.message || e);
         activeQuestions = getFallbackQuestions();
+        revealTextEl.innerText = "AI unavailable — using curated questions";
     } finally {
         clearInterval(interval);
+    }
+
+    if (!activeQuestions || activeQuestions.length !== QUESTIONS_PER_QUIZ) {
+        activeQuestions = getFallbackQuestions();
+    }
+
+    if (usedAI) {
+        revealTextEl.innerText = "Fresh AI questions ready";
     }
 
     setTimeout(() => {
