@@ -605,8 +605,8 @@ function showVibeDetail(vibeKey) {
 
 async function fetchAIQuestions() {
     // Key stays on the server (Vercel env / local .env). Browser never sees it.
-    // Retry a few times — Gemini often returns temporary 503/high-demand errors.
-    const maxAttempts = 3;
+    // One retry only for transient errors — quota/rate-limit must not spin more calls.
+    const maxAttempts = 2;
     let lastError = "Failed to generate AI questions";
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -623,31 +623,37 @@ async function fetchAIQuestions() {
 
             if (!response.ok) {
                 lastError = data.error || `HTTP error! status: ${response.status}`;
-                if (attempt < maxAttempts) {
-                    await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
-                    continue;
+                const quotaHit =
+                    response.status === 429 ||
+                    /quota|rate limit|too many requests/i.test(lastError);
+                if (quotaHit || attempt >= maxAttempts) {
+                    throw new Error(lastError);
                 }
-                throw new Error(lastError);
+                await new Promise((resolve) => setTimeout(resolve, 1500));
+                continue;
             }
 
             const normalizedQuestions = normalizeQuestionSet(data.questions || []);
 
             if (!isQuestionSetPG(normalizedQuestions)) {
                 lastError = "AI-generated questions failed PG content validation";
-                if (attempt < maxAttempts) {
-                    await new Promise((resolve) => setTimeout(resolve, 800 * attempt));
-                    continue;
+                if (attempt >= maxAttempts) {
+                    throw new Error(lastError);
                 }
-                throw new Error(lastError);
+                await new Promise((resolve) => setTimeout(resolve, 800));
+                continue;
             }
 
             return normalizedQuestions;
         } catch (error) {
             lastError = error.message || String(error);
-            if (attempt >= maxAttempts) {
+            if (
+                attempt >= maxAttempts ||
+                /quota|rate limit|too many requests/i.test(lastError)
+            ) {
                 throw new Error(lastError);
             }
-            await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
+            await new Promise((resolve) => setTimeout(resolve, 1500));
         }
     }
 

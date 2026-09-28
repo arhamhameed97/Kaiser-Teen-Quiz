@@ -1,12 +1,6 @@
 const QUESTIONS_PER_QUIZ = 5;
-const MODEL = "gemini-3.6-flash";
-const MODELS = [
-  "gemini-3.6-flash",
-  "gemini-flash-latest",
-  "gemini-3.7-flash",
-  "gemini-3.5-flash",
-  "gemini-3.8-flash"
-];
+// Keep this short — free-tier keys share tight per-model request quotas.
+const MODELS = ["gemini-flash-latest", "gemini-3.6-flash"];
 
 const PG_BLOCKED_TERMS = [
   "thirst trap", "thirst traps", "thirsty", "seductive", "sexy", "hot pic",
@@ -15,11 +9,21 @@ const PG_BLOCKED_TERMS = [
   "nude", "naked", "strip", "provocative", "suggestive", "inappropriate",
   "drunk", "alcohol", "beer", "wine", "vodka", "weed", "marijuana",
   "vape", "vaping", "cigarette", "smoking", "drug", "cocaine",
-    "damn", "hell", "crap", "shit", "fuck", "bitch", "ass",
-    "kill yourself", "suicide", "self-harm", "cutting",
-    "post my fits", "fits check", "body count", "ghosting",
-    "dm slide", "slide into", "netflix and chill"
+  "damn", "hell", "crap", "shit", "fuck", "bitch", "ass",
+  "kill yourself", "suicide", "self-harm", "cutting",
+  "post my fits", "fits check", "body count", "ghosting",
+  "dm slide", "slide into", "netflix and chill"
 ];
+
+function isQuotaError(message) {
+  const text = String(message || "").toLowerCase();
+  return (
+    text.includes("quota") ||
+    text.includes("rate limit") ||
+    text.includes("resource_exhausted") ||
+    text.includes("too many requests")
+  );
+}
 
 function isTextPG(text) {
   if (!text || typeof text !== "string") return false;
@@ -175,57 +179,62 @@ module.exports = async function handler(req, res) {
   }
 
   let lastError = "Failed to generate questions";
+  const randomSeed = Math.random().toString(36).substring(7);
 
   try {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const randomSeed = Math.random().toString(36).substring(7);
+    for (const model of MODELS) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const geminiResponse = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildGeminiRequestBody(randomSeed))
+      });
 
-      for (const model of MODELS) {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-        const geminiResponse = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(buildGeminiRequestBody(randomSeed))
-        });
+      const geminiPayload = await geminiResponse.json().catch(() => ({}));
 
-        const geminiPayload = await geminiResponse.json().catch(() => ({}));
+      if (!geminiResponse.ok) {
+        lastError =
+          (geminiPayload.error && geminiPayload.error.message) ||
+          `Gemini request failed (${geminiResponse.status})`;
 
-        if (!geminiResponse.ok) {
-          lastError =
-            (geminiPayload.error && geminiPayload.error.message) ||
-            `Gemini request failed (${geminiResponse.status})`;
-          continue;
+        // Stop immediately on quota — cascading models burns the free tier faster.
+        if (geminiResponse.status === 429 || isQuotaError(lastError)) {
+          sendJson(res, 429, {
+            error: "Gemini free-tier quota exceeded. Wait about a minute and try again."
+          });
+          return;
         }
-
-        const rawText =
-          geminiPayload.candidates &&
-          geminiPayload.candidates[0] &&
-          geminiPayload.candidates[0].content &&
-          geminiPayload.candidates[0].content.parts &&
-          geminiPayload.candidates[0].content.parts[0] &&
-          geminiPayload.candidates[0].content.parts[0].text;
-
-        if (!rawText) {
-          lastError = "Gemini returned an empty response";
-          continue;
-        }
-
-        let normalizedQuestions;
-        try {
-          normalizedQuestions = normalizeQuestionSet(JSON.parse(rawText));
-        } catch (parseError) {
-          lastError = "Gemini returned an empty or invalid response";
-          continue;
-        }
-
-        if (!isQuestionSetPG(normalizedQuestions)) {
-          lastError = "AI-generated questions failed PG content validation";
-          break;
-        }
-
-        sendJson(res, 200, { questions: normalizedQuestions, model });
-        return;
+        continue;
       }
+
+      const rawText =
+        geminiPayload.candidates &&
+        geminiPayload.candidates[0] &&
+        geminiPayload.candidates[0].content &&
+        geminiPayload.candidates[0].content.parts &&
+        geminiPayload.candidates[0].content.parts[0] &&
+        geminiPayload.candidates[0].content.parts[0].text;
+
+      if (!rawText) {
+        lastError = "Gemini returned an empty response";
+        continue;
+      }
+
+      let normalizedQuestions;
+      try {
+        normalizedQuestions = normalizeQuestionSet(JSON.parse(rawText));
+      } catch (parseError) {
+        lastError = "Gemini returned an empty or invalid response";
+        continue;
+      }
+
+      if (!isQuestionSetPG(normalizedQuestions)) {
+        lastError = "AI-generated questions failed PG content validation";
+        continue;
+      }
+
+      sendJson(res, 200, { questions: normalizedQuestions, model });
+      return;
     }
 
     sendJson(res, 502, { error: lastError });

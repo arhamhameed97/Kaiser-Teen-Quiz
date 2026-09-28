@@ -3,18 +3,14 @@ import socketserver
 import os
 import json
 import re
-import time
 import urllib.error
 import urllib.request
 
 PORT = 8000
-MODEL = "gemini-3.6-flash"
+MODEL = "gemini-flash-latest"
 MODELS = [
-    "gemini-3.6-flash",
     "gemini-flash-latest",
-    "gemini-3.7-flash",
-    "gemini-3.5-flash",
-    "gemini-3.8-flash",
+    "gemini-3.6-flash",
 ]
 QUESTIONS_PER_QUIZ = 5
 
@@ -173,6 +169,16 @@ def build_gemini_request_body(random_seed):
     }
 
 
+def is_quota_error(message):
+    text = str(message or "").lower()
+    return (
+        "quota" in text
+        or "rate limit" in text
+        or "resource_exhausted" in text
+        or "too many requests" in text
+    )
+
+
 def call_gemini(api_key, model, random_seed):
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -196,37 +202,39 @@ def generate_questions():
         }
 
     last_error = "Failed to generate questions"
-    for attempt in range(2):
-        random_seed = os.urandom(4).hex()
-        for model in MODELS:
-            try:
-                payload = call_gemini(api_key, model, random_seed)
-            except urllib.error.HTTPError as error:
-                try:
-                    details = json.loads(error.read().decode("utf-8"))
-                    last_error = details.get("error", {}).get("message") or str(error)
-                except Exception:
-                    last_error = str(error)
-                time.sleep(0.6)
-                continue
-            except Exception as error:
-                last_error = str(error)
-                time.sleep(0.6)
-                continue
+    random_seed = os.urandom(4).hex()
 
+    for model in MODELS:
+        try:
+            payload = call_gemini(api_key, model, random_seed)
+        except urllib.error.HTTPError as error:
             try:
-                raw_text = payload["candidates"][0]["content"]["parts"][0]["text"]
-                parsed = json.loads(raw_text)
-                normalized = normalize_question_set(parsed)
+                details = json.loads(error.read().decode("utf-8"))
+                last_error = details.get("error", {}).get("message") or str(error)
             except Exception:
-                last_error = "Gemini returned an empty or invalid response"
-                continue
+                last_error = str(error)
+            if error.code == 429 or is_quota_error(last_error):
+                return 429, {
+                    "error": "Gemini free-tier quota exceeded. Wait about a minute and try again."
+                }
+            continue
+        except Exception as error:
+            last_error = str(error)
+            continue
 
-            if not is_question_set_pg(normalized):
-                last_error = "AI-generated questions failed PG content validation"
-                break  # retry with a new seed
+        try:
+            raw_text = payload["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(raw_text)
+            normalized = normalize_question_set(parsed)
+        except Exception:
+            last_error = "Gemini returned an empty or invalid response"
+            continue
 
-            return 200, {"questions": normalized, "model": model}
+        if not is_question_set_pg(normalized):
+            last_error = "AI-generated questions failed PG content validation"
+            continue
+
+        return 200, {"questions": normalized, "model": model}
 
     return 502, {"error": last_error}
 
